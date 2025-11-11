@@ -1,205 +1,169 @@
-# rodents_app.py
+# streamlit_rodents.py
 import pandas as pd
+import numpy as np
 import plotly.express as px
 import streamlit as st
 
-st.set_page_config(page_title="NYC Rodent Inspections — Mini Dashboard", page_icon="🐀", layout="wide")
-
-# ---- palettes (colorblind-friendly) ----
-PAL_SEQ = px.colors.sequential.OrRd
-PAL_ALT = px.colors.sequential.Sunset
-PAL_QUAL = px.colors.qualitative.Set2
-
-# ---- sidebar controls ----
-st.sidebar.title("🐀 Rodent Dashboard — Controls")
-
-SAMPLE_N = st.sidebar.slider("Sample rows (keeps app fast)", min_value=5_000, max_value=100_000, value=30_000, step=5_000)
-MAX_MAP_POINTS = st.sidebar.slider("Max points on map", 1_000, 30_000, 8_000, 1_000)
-RESULT_PICK = st.sidebar.multiselect(
-    "Filter: Inspection Result",
-    options=["Passed", "Rat Activity", "Bait applied", "Failed for Other R", "Monitoring visit"],
-    default=["Passed", "Rat Activity", "Bait applied", "Failed for Other R", "Monitoring visit"],
+st.set_page_config(
+    page_title="NYC Rodent Inspections — Mini Dashboard",
+    page_icon="🐀",
+    layout="wide",
 )
 
-BORO_PICK = st.sidebar.multiselect(
-    "Filter: Borough",
-    options=["MANHATTAN", "BROOKLYN", "BRONX", "QUEENS", "STATEN ISLAND"],
-    default=[],
-)
-
-st.sidebar.caption("Tip: reduce sample/map points if the app feels slow.")
-
-# ---- data helpers ----
-DATA_URL = "https://data.cityofnewyork.us/api/views/p937-wjvj/rows.csv?accessType=DOWNLOAD"
-
-@st.cache_data(show_spinner=True)
-def load_clean(sample_n: int) -> pd.DataFrame:
-    df = pd.read_csv(DATA_URL, low_memory=False)
-    # keep lightweight columns
-    keep = [
-        "INSPECTION_DATE","BOROUGH","ZIP_CODE","INSPECTION_TYPE","RESULT",
-        "X_COORD","Y_COORD","LATITUDE","LONGITUDE","NTA"
-    ]
-    df = df[keep].copy()
-
-    # parse dates & derive parts
-    df["INSPECTION_DATE"] = pd.to_datetime(df["INSPECTION_DATE"], errors="coerce")
-    df = df.dropna(subset=["INSPECTION_DATE", "RESULT", "BOROUGH"])
-    df["INSPECTION_YEAR"] = df["INSPECTION_DATE"].dt.year
-    df["INSPECTION_MONTH"] = df["INSPECTION_DATE"].dt.month
-
-    # normalize categories
-    df["RESULT"] = df["RESULT"].replace({
-        "Bait applied":"Bait applied", "Rat Activity":"Rat Activity", "Passed":"Passed",
-        "Failed for Other R":"Failed for Other R", "Monitoring visit":"Monitoring visit"
-    })
-
-    # reasonable year window
-    df = df[(df["INSPECTION_YEAR"] >= 2010) & (df["INSPECTION_YEAR"] <= 2024)]
-
-    # sample for performance
-    if len(df) > sample_n:
-        df = df.sample(n=sample_n, random_state=42)
+# ========= Helper =========
+@st.cache_data(ttl=60*30, show_spinner=True)
+def load_rodent_data(limit=5000, start="2019-01-01", end="2024-12-31"):
+    """
+    Pulls a small, query-limited slice directly from NYC Open Data (Socrata API).
+    Only essential columns are requested to keep it fast and memory-light.
+    """
+    # Socrata "DOHMH Rodent Inspection" dataset id: p937-wjvj
+    base = "https://data.cityofnewyork.us/resource/p937-wjvj.csv"
+    select = (
+        "$select=inspection_date,borough,inspection_type,result,latitude,longitude,"
+        "nta,zip_code"
+    )
+    where = (
+        f"$where=inspection_date between '{start}T00:00:00.000' and '{end}T23:59:59.000'"
+        " AND latitude IS NOT NULL AND longitude IS NOT NULL"
+    )
+    url = f"{base}?{select}&{where}&$limit={int(limit)}"
+    df = pd.read_csv(url, low_memory=False)
+    # Basic cleaning
+    df["inspection_date"] = pd.to_datetime(df["inspection_date"], errors="coerce")
+    df = df.dropna(subset=["inspection_date", "borough", "result"])
+    df["year"] = df["inspection_date"].dt.year
+    df["month"] = df["inspection_date"].dt.month
+    df["ym"] = df["inspection_date"].dt.to_period("M").astype(str)
     return df
 
-with st.spinner("Loading & sampling NYC Rodent data…"):
-    df = load_clean(SAMPLE_N)
+# ========= Sidebar =========
+st.sidebar.title("Controls")
+st.sidebar.caption("Small sample for speed on Streamlit Cloud.")
 
-# filters
-if RESULT_PICK:
-    df = df[df["RESULT"].isin(RESULT_PICK)]
-if BORO_PICK:
-    df = df[df["BOROUGH"].isin(BORO_PICK)]
+limit = st.sidebar.slider("Rows to load", 1000, 25000, 5000, step=1000)
+years = st.sidebar.slider("Year range", 2019, 2024, (2019, 2024))
+result_filter = st.sidebar.multiselect(
+    "Result types",
+    ["Passed", "Rat Activity", "Bait applied", "Monitoring visit", "Failed for Other R"],
+    default=["Passed", "Rat Activity", "Bait applied", "Failed for Other R"],
+)
 
-# ---- header KPIs ----
+# ========= Load =========
+with st.spinner("Fetching a small slice from NYC Open Data…"):
+    df = load_rodent_data(limit=limit, start=f"{years[0]}-01-01", end=f"{years[1]}-12-31")
+
 st.title("🐀 NYC DOHMH Rodent Inspections — Mini Dashboard")
+st.caption("Fast sample (Socrata API, limited rows) for class demo / Streamlit Cloud.")
+
+if df.empty:
+    st.warning("No rows loaded. Try widening the year range or increasing the row limit.")
+    st.stop()
+
+# ========= Filters in-page =========
+colA, colB, colC = st.columns(3)
+with colA:
+    boroughs = ["All"] + sorted(df["borough"].dropna().unique().tolist())
+    pick_boro = st.selectbox("Borough", boroughs, index=0)
+with colB:
+    pick_result = st.multiselect("Result filter", sorted(df["result"].unique()), default=result_filter)
+with colC:
+    sample_for_map = st.slider("Max map points (subsample)", 500, 10000, 3000, 500)
+
+mask = df["result"].isin(pick_result) if pick_result else df["result"].notna()
+if pick_boro != "All":
+    mask &= df["borough"].eq(pick_boro)
+df_view = df.loc[mask].copy()
+
+st.markdown(f"**Loaded:** {len(df):,} rows · **After filters:** {len(df_view):,} rows")
+
+# ========= KPIs =========
 k1, k2, k3, k4 = st.columns(4)
 with k1:
-    st.metric("Rows (sampled)", f"{len(df):,}")
+    st.metric("Distinct Boroughs", df_view["borough"].nunique())
 with k2:
-    st.metric("Boroughs", df["BOROUGH"].nunique())
+    st.metric("NTA Areas", df_view["nta"].nunique())
 with k3:
-    st.metric("Year range", f"{int(df['INSPECTION_YEAR'].min())}–{int(df['INSPECTION_YEAR'].max())}")
+    st.metric("ZIP codes", df_view["zip_code"].nunique())
 with k4:
-    st.metric("Results shown", len(RESULT_PICK))
+    st.metric("Result types", df_view["result"].nunique())
 
-st.markdown("---")
+st.divider()
 
-# ---- tabs ----
-tab1, tab2, tab3 = st.tabs(["Overview", "Time & Seasonality", "Map"])
+# ========= Charts =========
+tab1, tab2, tab3 = st.tabs(["Trends", "Results & Boroughs", "Map"])
 
-# ---------------- Overview ----------------
+# Trends over time
 with tab1:
-    c1, c2 = st.columns([1, 1])
+    st.subheader("Inspections per Month")
+    month_ct = (
+        df_view.groupby("ym", as_index=False)
+        .size()
+        .rename(columns={"size": "count"})
+        .sort_values("ym")
+    )
+    fig_tr = px.line(
+        month_ct, x="ym", y="count", markers=True,
+        color_discrete_sequence=["#6a1b9a"],
+        labels={"ym": "Year-Month", "count": "Inspections"},
+        title="Monthly inspection counts"
+    )
+    fig_tr.update_layout(xaxis=dict(tickangle=-45))
+    st.plotly_chart(fig_tr, use_container_width=True)
 
-    with c1:
-        counts = (
-            df["RESULT"].value_counts()
-              .rename_axis("RESULT")
-              .reset_index(name="count")
-        )
-        fig = px.pie(
-            counts, names="RESULT", values="count",
-            hole=0.45, color="RESULT", color_discrete_sequence=PAL_QUAL,
-            title="Outcome Mix"
-        )
-        fig.update_traces(textinfo="percent+label", textposition="inside")
-        st.plotly_chart(fig, use_container_width=True)
+    st.caption("Tip: increase ‘Rows to load’ in the sidebar for richer trends.")
 
-    with c2:
-        boro = (
-            df["BOROUGH"].value_counts()
-              .rename_axis("BOROUGH")
-              .reset_index(name="count")
-              .sort_values("count", ascending=False)
-        )
-        fig = px.bar(
-            boro, x="BOROUGH", y="count",
-            color="count", color_continuous_scale=PAL_ALT,
-            title="Inspections by Borough"
-        )
-        fig.update_layout(xaxis_title="", yaxis_title="Inspections", coloraxis_showscale=False)
-        st.plotly_chart(fig, use_container_width=True)
-
-    st.caption("Tip: use the sidebar to filter by result/borough and resample rows.")
-
-# ------------- Time & Seasonality -------------
+# Result mix & Borough distribution
 with tab2:
-    c1, c2 = st.columns([1.2, 0.8])
+    c1, c2 = st.columns(2, gap="large")
 
     with c1:
-        yearly = (
-            df.groupby("INSPECTION_YEAR")
-              .size().reset_index(name="count")
-              .sort_values("INSPECTION_YEAR")
+        st.subheader("Result Mix")
+        res_ct = df_view["result"].value_counts().reset_index()
+        res_ct.columns = ["result", "count"]
+        fig_pie = px.pie(
+            res_ct, names="result", values="count",
+            hole=0.45, color="result",
+            color_discrete_sequence=px.colors.qualitative.Set2,
         )
-        fig = px.line(
-            yearly, x="INSPECTION_YEAR", y="count",
-            markers=True, color_discrete_sequence=[PAL_SEQ[5]],
-            title="Inspections per Year (2010–2024)"
-        )
-        # neat COVID annotation inside the plot area (near 2020)
-        if (yearly["INSPECTION_YEAR"] == 2020).any():
-            y2020 = yearly.loc[yearly["INSPECTION_YEAR"] == 2020, "count"].values[0]
-            fig.add_annotation(
-                x=2019.3, y=y2020*1.05, text="<b>COVID-19 dip</b>",
-                showarrow=True, arrowhead=3, ax=60, ay=-10,
-                arrowcolor="purple", font=dict(color="purple", size=14)
-            )
-        fig.update_layout(xaxis=dict(dtick=1))
-        st.plotly_chart(fig, use_container_width=True)
+        fig_pie.update_traces(textposition="inside", textinfo="label+percent")
+        st.plotly_chart(fig_pie, use_container_width=True)
 
     with c2:
-        month = (
-            df.groupby("INSPECTION_MONTH")
-              .size().reset_index(name="count")
-              .sort_values("INSPECTION_MONTH")
+        st.subheader("By Borough")
+        bor_ct = df_view["borough"].value_counts().reset_index()
+        bor_ct.columns = ["borough", "count"]
+        fig_bor = px.bar(
+            bor_ct, x="borough", y="count",
+            color="count", color_continuous_scale=px.colors.sequential.Sunset,
+            labels={"count": "Inspections", "borough": ""},
         )
-        month["MONTH"] = pd.to_datetime(month["INSPECTION_MONTH"], format="%m").dt.strftime("%b")
-        fig = px.bar(
-            month, x="MONTH", y="count",
-            color="count", color_continuous_scale=PAL_SEQ,
-            title="Seasonality — Inspections by Month"
-        )
-        fig.update_layout(xaxis_title="", yaxis_title="Inspections", coloraxis_showscale=False)
-        st.plotly_chart(fig, use_container_width=True)
+        fig_bor.update_layout(coloraxis_showscale=False)
+        st.plotly_chart(fig_bor, use_container_width=True)
 
-    # Year x Month heatmap (compact)
-    pivot = (
-        df.groupby(["INSPECTION_YEAR", "INSPECTION_MONTH"])
-          .size().reset_index(name="count")
-          .pivot(index="INSPECTION_YEAR", columns="INSPECTION_MONTH", values="count")
-          .fillna(0)
-    )
-    pivot.columns = [pd.to_datetime(str(int(m)), format="%m").strftime("%b") for m in pivot.columns]
-    fig = px.imshow(
-        pivot.values,
-        x=list(pivot.columns), y=list(pivot.index.astype(int)),
-        color_continuous_scale=PAL_SEQ, aspect="auto",
-        title="Heatmap — Year × Month"
-    )
-    fig.update_layout(xaxis_title="Month", yaxis_title="Year")
-    st.plotly_chart(fig, use_container_width=True)
-
-# ------------------- Map -------------------
+# Map
 with tab3:
-    st.subheader("Map — Sampled Points")
-    geo = df.dropna(subset=["LATITUDE", "LONGITUDE"])
-    if len(geo) > MAX_MAP_POINTS:
-        geo = geo.sample(n=MAX_MAP_POINTS, random_state=42)
+    st.subheader("Inspection Map (sampled for speed)")
+    geo = df_view.dropna(subset=["latitude", "longitude"])
+    if len(geo) > sample_for_map:
+        geo = geo.sample(sample_for_map, random_state=42)
 
-    fig = px.scatter_mapbox(
+    fig_map = px.scatter_mapbox(
         geo,
-        lat="LATITUDE", lon="LONGITUDE",
-        color="RESULT", color_discrete_sequence=PAL_QUAL,
-        hover_data=["BOROUGH", "INSPECTION_DATE", "INSPECTION_TYPE", "RESULT"],
-        zoom=9, height=650, title=f"Rodent Inspections (up to {len(geo):,} points)"
+        lat="latitude", lon="longitude",
+        color="result",
+        hover_data=["inspection_date", "borough", "inspection_type", "nta", "zip_code"],
+        zoom=9, height=600,
+        color_discrete_sequence=px.colors.qualitative.Set2,
     )
-    fig.update_layout(mapbox_style="open-street-map", margin=dict(l=0, r=0, t=60, b=0))
-    st.plotly_chart(fig, use_container_width=True)
+    fig_map.update_layout(mapbox_style="open-street-map", margin=dict(l=0, r=0, t=0, b=0))
+    st.plotly_chart(fig_map, use_container_width=True)
 
-st.markdown("---")
-st.caption("Data: NYC Open Data — DOHMH Rodent Inspection (2010–2024). This mini app uses a sampled subset for speed.")
+st.divider()
+with st.expander("Show raw (first 100 rows)"):
+    st.dataframe(df_view.head(100), use_container_width=True)
+
+
 
 
 
