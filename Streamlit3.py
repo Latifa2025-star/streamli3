@@ -1,129 +1,180 @@
+# Streamlit3.py
+# Minimal, fast Streamlit dashboard for NYC Rodent Inspections (sample via API)
+
+import os
+import json
+import requests
 import pandas as pd
-import numpy as np
 import plotly.express as px
 import streamlit as st
 
-st.set_page_config(page_title="NYC Rodent Inspections — Mini Dashboard", page_icon="🐀", layout="wide")
+st.set_page_config(page_title="NYC Rodent Inspections (Sample)", page_icon="🐀", layout="wide")
 
-# =========================
-# Settings (safe defaults)
-# =========================
-DATA_URL = "https://data.cityofnewyork.us/api/views/p937-wjvj/rows.csv?accessType=DOWNLOAD"
+st.title("🐀 NYC Rodent Inspections — Fast Sample Dashboard")
+st.caption("Source: NYC Open Data (DOHMH Rodent Inspection). This app pulls a small sample via API for quick loading.")
 
-# Read only the essential columns to keep memory tiny
-USECOLS = [
-    "INSPECTION_DATE", "BOROUGH", "ZIP_CODE", "INSPECTION_TYPE", "RESULT",
-    "LATITUDE", "LONGITUDE"
+# -----------------------------
+# Controls
+# -----------------------------
+with st.sidebar:
+    st.header("Controls")
+    sample_n = st.slider("Rows to fetch (API sample)", min_value=2_000, max_value=50_000, value=20_000, step=2_000)
+    years = st.slider("Year range", 2010, 2024, (2018, 2024))
+    show_map_points = st.slider("Max map points", 1000, 20000, 5000, 1000)
+    st.markdown("---")
+    st.markdown("**Optional**: add an app token in *Advanced settings → Secrets* as `NYC_APP_TOKEN` for higher API limits.")
+
+# -----------------------------
+# Data loader (API)
+# -----------------------------
+API = "https://data.cityofnewyork.us/resource/p937-wjvj.json"
+
+# Only the columns we need (keeps payload small)
+COLS = [
+    "borough",
+    "inspection_date",
+    "inspection_type",
+    "result",
+    "zip_code",
+    "nta",
+    "latitude",
+    "longitude",
 ]
 
-st.title("🐀 NYC Rodent Inspections — Mini Dashboard")
-st.caption("Small, fast sample so Streamlit Cloud starts reliably.")
+def build_query(year_lo: int, year_hi: int, limit: int) -> dict:
+    # Socrata $select/$where/$limit compliant params
+    where = (
+        f"inspection_date between '{year_lo}-01-01T00:00:00.000' "
+        f"and '{year_hi}-12-31T23:59:59.999'"
+    )
+    params = {
+        "$select": ",".join(COLS),
+        "$where": where,
+        "$order": "inspection_date DESC",
+        "$limit": limit
+    }
+    return params
 
-with st.sidebar:
-    st.header("Load Options")
-    nrows = st.slider("Sample rows to read", 5_000, 60_000, 25_000, 5_000,
-                      help="Read only this many rows from the remote CSV to stay fast.")
-    year_filter = st.selectbox("Keep only this year (optional)", ["All", 2018, 2019, 2020, 2021, 2022, 2023, 2024], index=0)
-    st.markdown("---")
-    st.caption("Tip: If startup still times out, lower the row limit further.")
+@st.cache_data(show_spinner=True, ttl=600)
+def fetch_sample(year_lo: int, year_hi: int, limit: int) -> pd.DataFrame:
+    params = build_query(year_lo, year_hi, limit)
+    headers = {}
+    # Optional app token via secrets
+    token = st.secrets.get("NYC_APP_TOKEN", None)
+    if token:
+        headers["X-App-Token"] = token
 
-@st.cache_data(show_spinner=True, ttl=60 * 60)
-def load_sample(url: str, nrows: int, usecols: list[str]) -> pd.DataFrame:
-    # Read a small, top-of-file sample and essential columns only
-    df = pd.read_csv(url, nrows=nrows, usecols=usecols, low_memory=False)
-    # Basic cleanup / enrich
-    df["INSPECTION_DATE"] = pd.to_datetime(df["INSPECTION_DATE"], errors="coerce")
-    df = df.dropna(subset=["INSPECTION_DATE", "BOROUGH", "RESULT"])
-    df["YEAR"] = df["INSPECTION_DATE"].dt.year
-    df["MONTH"] = df["INSPECTION_DATE"].dt.month
+    r = requests.get(API, params=params, headers=headers, timeout=60)
+    r.raise_for_status()
+    data = r.json()
+    if not data:
+        return pd.DataFrame(columns=COLS)
+
+    df = pd.DataFrame(data)
+    # Coerce dtypes
+    if "inspection_date" in df.columns:
+        df["inspection_date"] = pd.to_datetime(df["inspection_date"], errors="coerce")
+        df["year"] = df["inspection_date"].dt.year
+        df["month"] = df["inspection_date"].dt.month
+        df["month_name"] = df["inspection_date"].dt.strftime("%b")
+        df["year_month"] = df["inspection_date"].dt.to_period("M").astype(str)
+    for c in ["latitude", "longitude"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
     return df
 
-with st.spinner("Downloading a small sample…"):
-    df = load_sample(DATA_URL, nrows, USECOLS)
+with st.spinner("Fetching a small sample from NYC Open Data…"):
+    df = fetch_sample(years[0], years[1], sample_n)
 
-# Optional year filter (after load to keep cache effective)
-if year_filter != "All":
-    df = df.loc[df["YEAR"] == int(year_filter)]
+# -----------------------------
+# Guard rails
+# -----------------------------
+if df.empty:
+    st.warning("No data returned for the current filters. Try widening the year range or increasing the sample size.")
+    st.stop()
 
-# =========================
+# -----------------------------
 # KPIs
-# =========================
-k1, k2, k3, k4 = st.columns(4)
-with k1:
-    st.metric("Rows (sample)", f"{len(df):,}")
-with k2:
-    st.metric("Distinct ZIP Codes", f"{df['ZIP_CODE'].nunique():,}")
-with k3:
-    st.metric("Boroughs", df["BOROUGH"].nunique())
-with k4:
-    st.metric("Results", df["RESULT"].nunique())
+# -----------------------------
+c1, c2, c3, c4 = st.columns(4)
+with c1:
+    st.metric("Sample rows", f"{len(df):,}")
+with c2:
+    st.metric("Years", f"{years[0]}–{years[1]}")
+with c3:
+    st.metric("Boroughs", df["borough"].nunique())
+with c4:
+    st.metric("Outcomes", df["result"].nunique())
 
 st.divider()
 
-# =========================
-# Plot 1: Result mix
-# =========================
-st.subheader("Outcome Mix (Sample)")
-mix = df["RESULT"].value_counts().reset_index()
-mix.columns = ["RESULT", "count"]
-fig1 = px.bar(
-    mix, x="RESULT", y="count",
-    text="count",
-    color="RESULT",
-    color_discrete_sequence=px.colors.qualitative.Set2,
-    title="Inspection Outcomes (sample)"
+# -----------------------------
+# 1) Inspections over time (monthly)
+# -----------------------------
+st.subheader("Inspections Over Time (sample)")
+time_ct = (
+    df.dropna(subset=["year_month"])
+      .groupby("year_month", as_index=False)
+      .size()
+      .rename(columns={"size": "count"})
+      .sort_values("year_month")
 )
-fig1.update_traces(textposition="outside")
-fig1.update_layout(xaxis_title="", yaxis_title="Count", margin=dict(t=70))
-st.plotly_chart(fig1, use_container_width=None, width="stretch")
+fig_time = px.line(
+    time_ct, x="year_month", y="count",
+    markers=True,
+    title="Monthly inspection counts (sample)",
+)
+fig_time.update_layout(xaxis_title="", yaxis_title="Inspections")
+st.plotly_chart(fig_time, width="stretch")
 
-# =========================
-# Plot 2: Trend by month
-# =========================
-st.subheader("Inspections by Month (Sample)")
-trend = (
-    df.groupby(["YEAR", "MONTH"])
+# -----------------------------
+# 2) Outcomes by Borough
+# -----------------------------
+st.subheader("Outcomes by Borough (sample)")
+outcome_ct = (
+    df.groupby(["borough", "result"], dropna=False)
       .size()
       .reset_index(name="count")
-      .sort_values(["YEAR", "MONTH"])
 )
-trend["Month"] = pd.to_datetime(trend["MONTH"], format="%m").dt.strftime("%b")
-fig2 = px.line(
-    trend, x="Month", y="count", color="YEAR",
-    markers=True,
-    color_discrete_sequence=px.colors.sequential.Sunset,
-    title="Monthly Trend (by Year)"
+# keep top 5 outcomes by total volume for readable color legend
+top_outcomes = (
+    outcome_ct.groupby("result")["count"].sum()
+    .sort_values(ascending=False).head(5).index.tolist()
 )
-fig2.update_layout(yaxis_title="Inspections", xaxis_title="", legend_title="Year", margin=dict(t=70))
-st.plotly_chart(fig2, use_container_width=None, width="stretch")
+outcome_ct["result_top5"] = outcome_ct["result"].where(outcome_ct["result"].isin(top_outcomes), "Other/Minor")
 
-# =========================
-# Plot 3: Map (thinned)
-# =========================
+fig_out = px.bar(
+    outcome_ct, x="borough", y="count", color="result_top5",
+    title="Inspection outcomes by borough (collapsed to Top 5 + Other)",
+    barmode="stack"
+)
+fig_out.update_layout(xaxis_title="", yaxis_title="Inspections")
+st.plotly_chart(fig_out, width="stretch")
+
+# -----------------------------
+# 3) Map (sampled to keep it light)
+# -----------------------------
 st.subheader("Map — Sampled Points")
-geo = df.dropna(subset=["LATITUDE", "LONGITUDE"]).copy()
+geo = df.dropna(subset=["latitude", "longitude"]).copy()
+if len(geo) > show_map_points:
+    geo = geo.sample(show_map_points, random_state=42)
 
-# Thin points for performance
-MAX_POINTS = 3_000
-if len(geo) > MAX_POINTS:
-    geo = geo.sample(MAX_POINTS, random_state=42)
-
-if len(geo) == 0:
-    st.info("No geocoded points in the current sample/filter.")
-else:
-    fig3 = px.scatter_mapbox(
+if not geo.empty:
+    fig_map = px.scatter_mapbox(
         geo,
-        lat="LATITUDE", lon="LONGITUDE",
-        color="RESULT",
-        hover_data=["BOROUGH", "ZIP_CODE", "INSPECTION_TYPE", "RESULT"],
-        zoom=9, height=560,
-        color_discrete_sequence=px.colors.qualitative.Set2,
-        title=f"Rodent Inspections (up to {MAX_POINTS:,} points)"
+        lat="latitude", lon="longitude",
+        color="result",
+        hover_data=["borough", "zip_code", "inspection_type", "inspection_date"],
+        zoom=9, height=600,
+        title=f"Rodent inspections (up to {show_map_points:,} points from sample)"
     )
-    fig3.update_layout(mapbox_style="open-street-map", margin=dict(t=70, l=0, r=0, b=0))
-    st.plotly_chart(fig3, use_container_width=None, width="stretch")
+    fig_map.update_layout(mapbox_style="open-street-map", margin=dict(l=0, r=0, t=60, b=0))
+    st.plotly_chart(fig_map, width="stretch")
+else:
+    st.info("No rows with valid latitude/longitude in the current sample.")
 
-st.caption("Data: NYC Open Data — DOHMH Rodent Inspection.")
+st.caption("Tip: increase the sample size in the sidebar if you want more detail.")
+
 
 
 
